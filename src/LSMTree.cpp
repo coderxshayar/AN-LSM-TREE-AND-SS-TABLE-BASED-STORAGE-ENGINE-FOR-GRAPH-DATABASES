@@ -1,45 +1,37 @@
 #include "LSMTree.h"
+#include <iostream>
 #include <filesystem>
-#include <thread>
-#include <fstream>
-
-LSMTree::LSMTree(const std::string& base_dir) 
-    : base_dir_(base_dir), wal_(base_dir + "/wal/wal.log"), cache_(1000) {
-    sstables_.reserve(10);
-    std::filesystem::create_directories(base_dir + "/wal");
-    std::filesystem::create_directories(base_dir + "/sst");
-    load_sstables(); // Load existing SSTables
-}
-
-void LSMTree::load_sstables() {
-    for (const auto& entry : std::filesystem::directory_iterator(base_dir_ + "/sst")) {
-        if (entry.path().extension() == ".sst") {
-            sstables_.emplace_back(entry.path().string());
-        }
+LSMTree::LSMTree(const std::string& base_dir, size_t num_threads) 
+    : base_dir_(base_dir), cache_(1000), memtable_size_limit_(15000) {
+    memtables_.resize(num_threads);
+    memtable_mutexes_.resize(num_threads);
+    for (size_t i = 0; i < num_threads; ++i) {
+        memtable_mutexes_[i] = std::make_unique<std::mutex>();
     }
+    std::filesystem::create_directories(base_dir_ + "/sst");
+    load_sstables();
+    std::cout << "Initialized with " << sstables_.size() << " SSTables\n";
 }
+
 
 void LSMTree::put(const std::string& key, const std::string& value) {
-    wal_.append(key, value);
-    memtable_.put(key, value);
-    if (memtable_.size() >= memtable_size_limit_) {
-        auto current_data = memtable_.flush();
-        SSTable sst(base_dir_ + "/sst/sst_" + std::to_string(sstables_.size()) + ".sst");
-        sst.write(current_data);
-        sstables_.push_back(sst);
-        wal_.clear();
-        if (sstables_.size() > 5 && !compacting_) {
-            start_background_compaction();
-        }
-    }
+    size_t thread_idx = std::hash<std::thread::id>{}(std::this_thread::get_id()) % memtables_.size();
+    std::lock_guard<std::mutex> lock(*memtable_mutexes_[thread_idx]);
+    memtables_[thread_idx].put(key, value);
+    // No flush here—let it grow
 }
 
+
 std::string LSMTree::get(const std::string& key) {
-    std::string value = memtable_.get(key);
+    for (size_t i = 0; i < memtables_.size(); ++i) {
+        std::lock_guard<std::mutex> lock(*memtable_mutexes_[i]);
+        std::string value = memtables_[i].get(key);
+        if (!value.empty()) return value;
+    }
+    std:: string value = cache_.get(key);
     if (!value.empty()) return value;
-    if (!(value = cache_.get(key)).empty()) return value;
     for (const auto& sst : sstables_) {
-        value = sst.read(key);
+        std::string value = sst.read(key);
         if (!value.empty()) {
             cache_.put(key, value);
             return value;
@@ -48,41 +40,48 @@ std::string LSMTree::get(const std::string& key) {
     return "";
 }
 
-void LSMTree::compact() {
-    if (sstables_.size() <= 1) return;
-    std::map<std::string, std::string> merged;
-    for (const auto& sst : sstables_) {
-        std::ifstream file(sst.get_filepath());
-        std::string line;
-        while (std::getline(file, line)) {
-            size_t pos = line.find(':');
-            if (pos != std::string::npos) {
-                merged[line.substr(0, pos)] = line.substr(pos + 1);
-            }
-        }
-        file.close();
-        std::filesystem::remove(sst.get_filepath());
-    }
-    sstables_.clear();
-    SSTable new_sst(base_dir_ + "/sst/sst_0.sst");
-    new_sst.write(merged);
-    sstables_.push_back(new_sst);
-}
-
-void LSMTree::start_background_compaction() {
-    if (compacting_.exchange(true)) return;
-    std::thread([this]() {
-        compact();
-        compacting_ = false;
-    }).detach();
-}
-
 void LSMTree::flush() {
-    if (!memtable_.empty()) {
-        auto current_data = memtable_.flush();
-        SSTable sst(base_dir_ + "/sst/sst_" + std::to_string(sstables_.size()) + ".sst");
+    for (size_t i = 0; i < memtables_.size(); ++i) {
+        std::lock_guard<std::mutex> lock(*memtable_mutexes_[i]);  // Lock each memtable
+        if (memtables_[i].size() > 0) {
+            std::lock_guard<std::mutex> log_lock(log_mutex_);
+            std::cout << "Flushing memtable " << i << " with " << memtables_[i].size() << " entries\n";
+            auto current_data = memtables_[i].flush();
+            std::string filepath = base_dir_ + "/sst/sst_" + std::to_string(sstables_.size()) + ".sst";
+            SSTable sst(filepath);
+            sst.write(current_data);
+            sstables_.push_back(std::move(sst));
+            std::cout << "SSTable count: " << sstables_.size() << "\n";
+        }
+    }
+}
+
+void LSMTree::flush_thread(size_t idx) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    if (memtables_[idx].size() > 0) {
+        std::lock_guard<std::mutex> log_lock(log_mutex_);
+        std::cout << "Flushing memtable " << idx << " with " << memtables_[idx].size() << " entries\n";
+        auto current_data = memtables_[idx].flush();
+        std::string filepath = base_dir_ + "/sst/sst_" + std::to_string(sstables_.size()) + ".sst";
+        SSTable sst(filepath);
         sst.write(current_data);
-        sstables_.push_back(sst);
-        wal_.clear();
+        sstables_.push_back(std::move(sst));
+        std::cout << "SSTable count: " << sstables_.size() << "\n";
+    }
+}
+
+size_t LSMTree::memtable_size() const {
+    size_t total = 0;
+    for (const auto& mt : memtables_) {
+        total += mt.size();
+    }
+    return total;
+}
+
+void LSMTree::load_sstables() {
+    for (const auto& entry : std::filesystem::directory_iterator(base_dir_ + "/sst")) {
+        if (entry.path().extension() == ".sst") {
+            sstables_.emplace_back(entry.path().string());
+        }
     }
 }

@@ -1,30 +1,34 @@
 #ifndef LSMTREE_H
 #define LSMTREE_H
 
+#include <string>
+#include <vector>
+#include <memory>  // For unique_ptr
+#include <mutex>
+#include <filesystem>
+
 #include "MemTable.h"
-#include "WAL.h"
 #include "SSTable.h"
 #include "Cache.h"
-#include <vector>
-#include <atomic>
 
 class LSMTree {
 public:
-    LSMTree(const std::string& base_dir);
+    LSMTree(const std::string& base_dir, size_t num_threads = 8);
     void put(const std::string& key, const std::string& value);
     std::string get(const std::string& key);
-    void compact();
-    void start_background_compaction();
     void flush();
+    void flush_thread(size_t idx);
+    size_t memtable_size() const;
 private:
-    void load_sstables(); // Add this
-    MemTable memtable_;
-    WAL wal_;
-    std::vector<SSTable> sstables_;
-    Cache cache_;
+    void load_sstables();
     std::string base_dir_;
-    size_t memtable_size_limit_ = 10000;
-    std::atomic<bool> compacting_{false};
+    Cache cache_;
+    std::vector<MemTable> memtables_;
+    std::vector<std::unique_ptr<std::mutex>> memtable_mutexes_;
+    std::vector<SSTable> sstables_;
+    std::mutex write_mutex_;
+    std::mutex log_mutex_;
+    size_t memtable_size_limit_;
 };
 
 #endif

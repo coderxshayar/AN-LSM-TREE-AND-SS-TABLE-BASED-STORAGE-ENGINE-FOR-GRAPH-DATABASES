@@ -1,36 +1,23 @@
 #include "GraphDB.h"
 #include <sstream>
 #include <set>
-
-GraphDB::GraphDB(const std::string& base_dir) : lsm_(base_dir) {}
+#include <iostream>
 
 void GraphDB::add_edge(const std::string& from, const std::string& to) {
+    size_t shard = std::hash<std::string>{}(from) % 64;
+    std::lock_guard<std::mutex> lock(add_edge_mutex_[shard]);
     std::string neighbors = lsm_.get(from);
-    std::set<std::string> neighbor_set;
-    
-    // Parse existing neighbors into a set
-    if (!neighbors.empty()) {
-        std::stringstream ss(neighbors);
-        std::string neighbor;
-        while (std::getline(ss, neighbor, ',')) {
-            neighbor_set.insert(neighbor);
-        }
+    if (neighbors.empty()) {
+        lsm_.put(from, to);
+    } else if (neighbors.find(to) == std::string::npos) {
+        std::string new_neighbors;
+        new_neighbors.reserve(neighbors.size() + to.size() + 1);
+        new_neighbors = neighbors + "," + to;
+        lsm_.put(from, new_neighbors);
     }
-    
-    // Add new neighbor
-    neighbor_set.insert(to);
-    
-    // Rebuild the neighbors string
-    std::string new_neighbors;
-    for (auto it = neighbor_set.begin(); it != neighbor_set.end(); ++it) {
-        if (!new_neighbors.empty()) new_neighbors += ",";
-        new_neighbors += *it;
-    }
-    
-    lsm_.put(from, new_neighbors);
 }
-std::string GraphDB::get_neighbors(const std::string& node) {
-    return lsm_.get(node);
+std::string GraphDB::get_neighbors(const std::string& from) {
+    return lsm_.get(from);
 }
 
 void GraphDB::flush() {
